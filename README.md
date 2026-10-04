@@ -76,6 +76,15 @@ updater. It adds the missing `SkillLineAbility` row for skill line 789
 Barber (creature 9000001). Two Forms works only on characters that learn it, which
 happens on login for every worgen.
 
+## Quests and items open to every race
+
+`worgoblin.sql` adds worgen wherever humans may take a quest or use an item,
+but skips masks it reads as "all races", among them 2047 (races 1-11, without
+worgen). Its goblin update also turns the ten-race mask 1791 into 2047 first.
+`data/sql/db-world/worgoblin_worgen_masks.sql` gives worgen every mask that
+names all ten original races, which opens the Netherwing chain, To Skettis! and
+a few other quests and items.
+
 ## Credits
 
 * mthsena for creating a repository for the [original script](https://github.com/mthsena/trinitycore_scripts/tree/master/scripts/CustomRaces) for TrinityCore.
