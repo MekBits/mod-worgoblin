@@ -1,10 +1,10 @@
-# This is no longer being maintained.
-
 # Worgoblin Module
 
-[![core-build](https://github.com/benjymansy123/mod-worgoblin/actions/workflows/core-build.yml/badge.svg)](https://github.com/benjymansy123/mod-worgoblin/actions/workflows/core-build.yml)
+[![core-build](https://github.com/MekBits/mod-worgoblin/actions/workflows/core-build.yml/badge.svg)](https://github.com/MekBits/mod-worgoblin/actions/workflows/core-build.yml)
 
 This is a module for [AzerothCore](http://www.azerothcore.org) that adds worgen, goblins, and numerous features related to their playability.
+
+This is a fork of [heyitsbench/mod-worgoblin](https://github.com/heyitsbench/mod-worgoblin), which is no longer maintained. It adds [Two Forms](#two-forms) for worgen; everything else is the original module.
 
 ## Important Notes
 
@@ -30,6 +30,51 @@ I recommend Windows users to use [this patcher](https://www.wowmodding.net/files
 Because WoW uses signature checks so as to not allow Interface files to be modified, we need to remove those checks in order to be able to use custom races. This is accomplished using the patcher included in the repo. Move the patcher into your WoW client directory and run it. Again, feel free to make a backup of your original executable.
 
 And with that, you are all done!
+
+## Two Forms
+
+Worgen learn **Two Forms** (spell 68996) with their other racials and can switch
+between their worgen and human appearance, as in Cataclysm. No client change is
+needed beyond the module's own patch.
+
+- **Combat brings the wolf out.** The human form is a wish: entering combat
+  switches to worgen form, and the human form returns when combat ends. Set
+  `Worgoblin.TwoForms.CombatShift = 0` to stay human in combat.
+- **Darkflight** ("Activates your true form") ends the human form.
+- **Druid forms** are left alone; the form changes only outside shapeshift.
+- **The form survives logout.** The aura is saved like any other, and the
+  character list always shows the worgen appearance.
+- **The human form has its own look.** It starts as your worgen choices (always
+  valid, since the worgen ranges are a subset of the human ones). The normal
+  barbershop styles hair, hair colour and facial hair of the form you are in.
+  Skin and face cannot be changed at a barbershop in WotLK, so the **Gilnean
+  Barber** (Shadowglen and the Stormwind barbershop) does that: stand in human
+  form and talk to him.
+
+How it works in 3.3.5, where the client has neither Cataclysm's aura type nor a
+second appearance per character:
+
+- The client takes the **model** from `UNIT_FIELD_DISPLAYID`, but composes skin,
+  face and hair from the **race byte** in `UNIT_FIELD_BYTES_0` looked up in
+  `CharSections.dbc`. Both are set: human display 49/50 (not the illusion
+  creatures 20707/20708, whose display hides your gear) and race byte 1.
+- The race byte is safe to change: `Unit::getRace()` returns `m_race`, and
+  `_SaveCharacter()` saves the race from `getRace(true)` and the gender from
+  `PLAYER_BYTES_3`.
+- The appearance bytes in `PLAYER_BYTES`/`PLAYER_BYTES_2` **are** saved, so the
+  table `worgen_form_appearance` (characters database) holds both sets. The
+  worgen set is written back in `OnPlayerBeforeLogout`, before `SaveToDB()`.
+  If the server dies while someone is in human form, the next login puts it
+  right.
+- The barbershop has no script hook, so a haircut in human form is detected by
+  comparing the fields with the saved human set.
+
+The SQL (`data/sql/db-world/worgoblin_two_forms.sql`,
+`data/sql/db-characters/worgen_form_appearance.sql`) is applied by the database
+updater. It adds the missing `SkillLineAbility` row for skill line 789
+"Racial - Worgen", binds the spell scripts, and creates and spawns the Gilnean
+Barber (creature 9000001). Two Forms works only on characters that learn it, which
+happens on login for every worgen.
 
 ## Credits
 
