@@ -5,7 +5,8 @@
 -- AzerothCore has replaced that C++ script with SmartAI on the original
 -- prisoners, so the two kneel without ever speaking and the quests cannot be
 -- completed. They get the same SmartAI as Ellen Stanbridge (29061): the
--- shared action list 2907400 plays their creature_text groups 0-9.
+-- shared action list 2907400 plays their creature_text groups 0-9. The two
+-- quests also lack the quest_template_addon row of the original ten.
 --
 -- Nothing happens unless the supplementary file has been applied: every
 -- statement is limited to the creatures (and quests) that exist.
@@ -34,6 +35,13 @@ JOIN (
   UNION ALL SELECT 6, 0, 1, 1, 0, 30000, 60000, 30000, 60000, 0, 5, 18, 0, 1, ' - Out of Combat - Play Emote 18 (Phase 1)'
 ) s
 WHERE ct.`entry` IN (49355, 49356);
+
+-- The chain as for the original quests: after 12738, death knights only, and
+-- NextQuestID 12751, which is what lets the player take "A Sort Of
+-- Homecoming" (RewardNextQuest only offers it).
+DELETE FROM `quest_template_addon` WHERE `ID` IN (28649, 28650);
+INSERT INTO `quest_template_addon` (`ID`, `AllowableClasses`, `PrevQuestID`, `NextQuestID`)
+SELECT `ID`, 32, 12738, 12751 FROM `quest_template` WHERE `ID` IN (28649, 28650);
 
 -- Event 3 (SourceGroup 4) only for a player with the quest incomplete.
 DELETE FROM `conditions` WHERE `SourceTypeOrReferenceId` = 22 AND `SourceGroup` = 4 AND `SourceEntry` IN (49355, 49356);
