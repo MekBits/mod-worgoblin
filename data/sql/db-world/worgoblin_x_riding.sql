@@ -13,12 +13,12 @@
 -- Covers the option, the greeting and the negated "not human" greeting.
 UPDATE `conditions` SET `ConditionValue1` = `ConditionValue1` | 2048
   WHERE `SourceTypeOrReferenceId` IN (14, 15) AND `SourceGroup` IN (4004, 4018)
-    AND `ConditionTypeOrReference` = 16 AND `ConditionValue1` = 1;
+    AND `ConditionTypeOrReference` = 16 AND (`ConditionValue1` & 1791) = 1;
 
 -- "Is orc": Kildar (4020) and Ogunaro Wolfrunner (3161).
 UPDATE `conditions` SET `ConditionValue1` = `ConditionValue1` | 256
   WHERE `SourceTypeOrReferenceId` IN (14, 15) AND `SourceGroup` IN (3161, 4020)
-    AND `ConditionTypeOrReference` = 16 AND `ConditionValue1` = 2;
+    AND `ConditionTypeOrReference` = 16 AND (`ConditionValue1` & 1791) = 2;
 
 -- The race riding trainers greet everyone but their own race with a mask of
 -- the other nine original races. Goblins and worgen get that greeting too,
@@ -31,5 +31,5 @@ UPDATE `conditions` SET `ConditionValue1` = `ConditionValue1`
     AND BIT_COUNT(`ConditionValue1` & 1791) = 9;
 
 -- The riding trainer's letter at level 20 and 40.
-UPDATE `mail_level_reward` SET `raceMask` = `raceMask` | 2048 WHERE `raceMask` = 1;
-UPDATE `mail_level_reward` SET `raceMask` = `raceMask` | 256 WHERE `raceMask` = 2;
+UPDATE `mail_level_reward` SET `raceMask` = `raceMask` | 2048 WHERE (`raceMask` & 1791) = 1;
+UPDATE `mail_level_reward` SET `raceMask` = `raceMask` | 256 WHERE (`raceMask` & 1791) = 2;
