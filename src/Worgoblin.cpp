@@ -616,6 +616,14 @@ public:
             discount *= 0.8;
     }
 
+    // RedrawFace() restores the skin from the map it was started on; a player
+    // who changed map before that never gets the event.
+    void OnPlayerMapChanged(Player* player) override
+    {
+        if (IsWorgenPlayer(player) && Forms(player)->loaded)
+            EndFaceRedraw(player);
+    }
+
     void OnPlayerEnterCombat(Player* player, Unit* /*enemy*/) override
     {
         if (IsWorgenPlayer(player))
