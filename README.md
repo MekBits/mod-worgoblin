@@ -92,4 +92,5 @@ a few other quests and items.
 * [yuan2105](https://github.com/yuanf225) for racing me to get these working and helping me out on multiple occasions.
 * [Tanados](https://github.com/helldragonpz) for adapting the HD patch to work with the module.
 * Trimitor#3873 for creating the HD patch.
+* [Maayv](https://github.com/Maayv/mod-worgoblin) for the worgen footprint timing and Cataclysm's goblin combat sounds.
 * Various users on various Discords for helping me out on a slew of issues with almost everything. (ragestriker#8037 and Mr.MA#0957 in particular)
