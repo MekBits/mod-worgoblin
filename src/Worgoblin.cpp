@@ -3,6 +3,11 @@
 #include "Creature.h"
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
+#include "GameObject.h"
+#include "Map.h"
+#include "ObjectAccessor.h"
+#include "ObjectMgr.h"
+#include "Opcodes.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "ScriptedGossip.h"
@@ -10,6 +15,8 @@
 #include "SpellAuraEffects.h"
 #include "Config.h"
 #include "StringFormat.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
 
 #include <algorithm>
 #include <string>
@@ -54,6 +61,13 @@ enum Spells
 //
 // Darkflight (68992) also switches to wolf form: its own description in
 // Spell.dbc says "Activates your true form".
+//
+// The native display follows the form. The 3.3.5 client counts a player whose
+// UNIT_FIELD_DISPLAYID differs from UNIT_FIELD_NATIVEDISPLAYID as
+// shapeshifted: it refuses the barber chair ("You can't do that while
+// shapeshifted"), and the core's Unit::IsInDisallowedMountForm() refuses
+// mounts and taxis. So in human form the native display is the human one, and
+// the worgen model is looked up where it is needed (WorgenDisplay()).
 
 enum WorgenTwoForms
 {
@@ -63,6 +77,16 @@ enum WorgenTwoForms
     DISPLAY_HUMAN_MALE   = 49,
     DISPLAY_HUMAN_FEMALE = 50,
     NPC_GILNEAN_BARBER   = 9000001,
+};
+
+// The effect and sound Cataclysm plays when the form changes. Both are
+// SpellVisualKit rows a stock 3.3.5 client does not have: they need the
+// SpellVisualKit.dbc of MekBits' patch-Z (github.com/MekBits/azerothcore).
+// Without them the client plays nothing.
+enum WorgenTransformVisuals
+{
+    VISUAL_KIT_TO_WORGEN = 16173,   // Worgen_Combat_Transform_FX, "Worgen_Transform_Worgen"
+    VISUAL_KIT_TO_HUMAN  = 28505,   // "Worgen_Transform_Human"
 };
 
 // Index into the two appearance arrays.
@@ -85,6 +109,9 @@ struct WorgenFormData : public DataMap::Base
     bool  human      = false;   // the fields hold the human set
     bool  savedHuman = false;   // `saved` is a human set
     bool  updating   = false;   // inside UpdateForm()
+    bool  redrawing  = false;   // the skin field holds redrawSkin (RedrawFace())
+    uint8 redrawSkin = 0;
+    uint32 redrawId  = 0;       // which RedrawFace() the pending event belongs to
 };
 
 static bool sCombatShift = true;
@@ -141,6 +168,16 @@ static uint8 NativeGender(Player* player)
 static uint32 HumanDisplay(Player* player)
 {
     return NativeGender(player) == GENDER_MALE ? DISPLAY_HUMAN_MALE : DISPLAY_HUMAN_FEMALE;
+}
+
+// The worgen model, as Player::InitDisplayIds() picks it. Not the native
+// display: that is the human one in human form.
+static uint32 WorgenDisplay(Player* player)
+{
+    PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(true), player->getClass());
+    if (!info)
+        return player->GetNativeDisplayId();
+    return NativeGender(player) == GENDER_MALE ? info->displayId_m : info->displayId_f;
 }
 
 static void ReadAppearance(Player* player, uint8* out)
@@ -254,16 +291,56 @@ static void LoadForms(Player* player)
     SaveForms(player);
 }
 
+// Runs fn(player) after the update fields changed now have been sent, so the
+// client sees both values. Map::Update() sends the fields only in an update
+// with a time step (MapUpdateInterval), and players are also updated in the
+// steps between, so the player's own events can run twice before anything is
+// sent. The map's events advance only in the updates that send, before they
+// do: the first event can still run before this change goes out, the second
+// (added while events run, so not run in the same pass) one sending update
+// later. A player who has left the map by then is skipped.
+template<typename Fn>
+static void AfterFieldsSent(Player* player, Fn fn)
+{
+    Map* map = player->GetMap();
+    ObjectGuid const guid = player->GetGUID();
+    map->Events.AddEventAtOffset([map, guid, fn]()
+    {
+        map->Events.AddEventAtOffset([map, guid, fn]()
+        {
+            if (Player* p = ObjectAccessor::GetPlayer(map, guid))
+                fn(p);
+        }, 1ms);
+    }, 1ms);
+}
+
+// Puts the real skin back after RedrawFace(), if nothing has rewritten the
+// field since. Called before anything reads the fields back, so the stand-in
+// skin is never taken for a barbershop change.
+static void EndFaceRedraw(Player* player)
+{
+    WorgenFormData* d = Forms(player);
+    if (!d->redrawing)
+        return;
+
+    d->redrawing = false;
+    if (d->human && player->GetByteValue(PLAYER_BYTES, 0) == d->redrawSkin)
+        player->SetByteValue(PLAYER_BYTES, 0, d->h[A_SKIN]);
+}
+
 // The barbershop has no script hook: WorldSession::HandleAlterAppearance ->
 // Player::ChangeBarberShopStyle calls no scripts. So a haircut is detected by
 // comparing. In human form, fields that differ from the human set can only
-// come from the barbershop -> adopt them for the human form. The server only
-// accepts worgen styles (it checks getRace()), so they are moved to valid
-// human values. In wolf form the fields are the wolf set. Returns true if the
-// human set changed.
+// come from the barbershop -> adopt them for the human form. A real client in
+// human form sends human styles, which HumanFormHaircut() below applies;
+// worgen styles go through the core, which accepts them (it checks getRace()),
+// so they are moved to valid human values here. In wolf form the fields are
+// the wolf set. Returns true if the human set changed.
 static bool ReadBackFields(Player* player)
 {
     WorgenFormData* d = Forms(player);
+    EndFaceRedraw(player);
+
     if (!d->human)
     {
         ReadAppearance(player, d->w);
@@ -284,7 +361,8 @@ static bool ReadBackFields(Player* player)
 // Only through UpdateForm(), which guards against re-entry. `asked`: the core
 // handed the display to Two Forms (RestoreDisplayId(), or the resend after
 // login or a teleport); CanChangeForm() below rules out other owners.
-static void SetWorgenForm(Player* player, bool human, bool asked)
+// `visual`: the caller is a real switch (see UpdateForm()).
+static void SetWorgenForm(Player* player, bool human, bool asked, bool visual)
 {
     WorgenFormData* d = Forms(player);
 
@@ -292,25 +370,34 @@ static void SetWorgenForm(Player* player, bool human, bool asked)
     if (ReadBackFields(player))
         SaveForms(player);
 
+    bool const switched = d->human != human;
     d->human = human;
     player->SetByteValue(UNIT_FIELD_BYTES_0, 0, human ? uint8(RACE_HUMAN) : uint8(RACE_WORGEN_ID));
     WriteAppearance(player, human ? d->h : d->w);
+
+    // Also while another aura owns the display: Unit::RestoreDisplayId()
+    // falls back to the native display when that aura ends.
+    uint32 const display = human ? HumanDisplay(player) : WorgenDisplay(player);
+    player->SetNativeDisplayId(display);
 
     if (!CanChangeForm(player))
         return;
 
     // In wolf form only replace our own human display, or one handed to Two
-    // Forms: InitDisplayIds() (.modify gender) sets the new display before the
-    // new native one.
+    // Forms. Any other display (a GM's .morph) was set on purpose.
     uint32 const current = player->GetDisplayId();
     bool const ours = current == DISPLAY_HUMAN_MALE || current == DISPLAY_HUMAN_FEMALE;
-    uint32 const display = human ? HumanDisplay(player) : player->GetNativeDisplayId();
     if (current != display && (human || ours || asked))
     {
         // SetDisplayId() resets the scale; keep scale auras (Giant Growth).
         player->SetDisplayId(display);
         player->RecalculateObjectScale();
     }
+
+    // Not on death: dying in combat ends combat (human form back) and then
+    // removes Two Forms (wolf form) in the same tick.
+    if (visual && switched && player->IsAlive())
+        player->SendPlaySpellVisual(human ? VISUAL_KIT_TO_HUMAN : VISUAL_KIT_TO_WORGEN);
 }
 
 // Human while Two Forms is on, unless another aura owns the display, combat
@@ -325,14 +412,17 @@ static bool WantsHuman(Player* player)
 
 static bool IsPlayerModel(Player* player, uint32 display)
 {
-    return display == player->GetNativeDisplayId() || display == DISPLAY_HUMAN_MALE ||
+    return display == WorgenDisplay(player) || display == DISPLAY_HUMAN_MALE ||
            display == DISPLAY_HUMAN_FEMALE;
 }
 
 // The one place the form is decided, called from every hook that can change
 // WantsHuman() and from every display change. `asked`: the core handed the
-// display to Two Forms (see SetWorgenForm()).
-static void UpdateForm(Player* player, bool asked = false)
+// display to Two Forms (see SetWorgenForm()). `visual`: the caller is a real
+// switch - Two Forms cast or cancelled (Darkflight cancels it), combat start
+// or end - so a form change plays the transformation. Not at login, logout,
+// the resend after a teleport, or when another aura ends.
+static void UpdateForm(Player* player, bool asked = false, bool visual = false)
 {
     WorgenFormData* d = Forms(player);
 
@@ -342,7 +432,7 @@ static void UpdateForm(Player* player, bool asked = false)
     d->updating = true;
 
     if (d->loaded)
-        SetWorgenForm(player, WantsHuman(player), asked);
+        SetWorgenForm(player, WantsHuman(player), asked, visual);
 
     // Another transform owns the display, but RestoreDisplayId() only asks the
     // newest transform, and under a warrior stance it sets the native display
@@ -529,13 +619,13 @@ public:
     void OnPlayerEnterCombat(Player* player, Unit* /*enemy*/) override
     {
         if (IsWorgenPlayer(player))
-            UpdateForm(player);
+            UpdateForm(player, false, true);
     }
 
     void OnPlayerLeaveCombat(Player* player) override
     {
         if (IsWorgenPlayer(player))
-            UpdateForm(player);
+            UpdateForm(player, false, true);
     }
 };
 
@@ -608,22 +698,25 @@ class spell_worgen_two_forms_aura : public AuraScript
     //
     // The aura survives logout (Aura::CanBeSaved() says yes: not passive, not
     // channeled, self-cast, infinite duration), so the form is remembered.
+    //
+    // REAL is the cast and the cancel; the aura loaded at login is REAL too,
+    // but UpdateForm() does nothing before OnPlayerLogin.
     void HandleApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes mode)
     {
         PreventDefaultAction();
 
         Player* target = GetTarget() ? GetTarget()->ToPlayer() : nullptr;
         if (IsWorgenPlayer(target))
-            UpdateForm(target, mode == AURA_EFFECT_HANDLE_SEND_FOR_CLIENT);
+            UpdateForm(target, mode == AURA_EFFECT_HANDLE_SEND_FOR_CLIENT, (mode & AURA_EFFECT_HANDLE_REAL) != 0);
     }
 
-    void HandleRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+    void HandleRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes mode)
     {
         PreventDefaultAction();
 
         Player* target = GetTarget() ? GetTarget()->ToPlayer() : nullptr;
         if (IsWorgenPlayer(target))
-            UpdateForm(target);
+            UpdateForm(target, false, (mode & AURA_EFFECT_HANDLE_REAL) != 0);
     }
 
     void Register() override
@@ -662,6 +755,43 @@ class spell_worgen_darkflight : public SpellScript
 // face are set at character creation in WotLK, so this NPC handles them.
 // Everything is applied live, so the menu itself is the preview - which is why
 // you have to be in human form to use it.
+
+// The client builds a player's textures again when the skin changes, not when
+// only the face does, so a new face alone would stay invisible until the next
+// form change. So the skin field shows a neighbouring skin for one map update and
+// then the real one again: the second change draws the new face.
+static void RedrawFace(Player* player)
+{
+    WorgenFormData* d = Forms(player);
+    uint8 const skin = d->h[A_SKIN];
+    uint8 const face = d->h[A_FACE];
+
+    // Preferably a skin that has this face, so the update in between has one.
+    uint8 stand = skin;
+    for (int dir : { 1, -1 })
+    {
+        uint8 const candidate = CycleSkin(player, skin, dir);
+        if (candidate != skin && HumanFaceExists(player, face, candidate))
+        {
+            stand = candidate;
+            break;
+        }
+    }
+    if (stand == skin)
+        stand = CycleSkin(player, skin, 1);
+    if (stand == skin)
+        return;   // a single skin: nothing to switch through
+
+    player->SetByteValue(PLAYER_BYTES, 0, stand);
+    d->redrawing = true;
+    d->redrawSkin = stand;
+    uint32 const id = ++d->redrawId;
+    AfterFieldsSent(player, [id](Player* p)
+    {
+        if (Forms(p)->redrawId == id)
+            EndFaceRedraw(p);
+    });
+}
 
 enum GilneanBarberActions
 {
@@ -709,6 +839,10 @@ public:
             return true;
         }
 
+        EndFaceRedraw(player);
+        uint8 const oldSkin = d->h[A_SKIN];
+        uint8 const oldFace = d->h[A_FACE];
+
         switch (action)
         {
             case GB_SKIN_NEXT:
@@ -743,6 +877,8 @@ public:
         }
 
         WriteAppearance(player, d->h);   // live preview
+        if (d->h[A_FACE] != oldFace && d->h[A_SKIN] == oldSkin)
+            RedrawFace(player);
         SaveForms(player);
         BuildMenu(player, creature);
         return true;
@@ -772,6 +908,106 @@ private:
     }
 };
 
+// --- Barbershop in human form ------------------------------------------------
+//
+// In human form the client offers human styles (it reads the race byte), and
+// WorldSession::HandleAlterAppearance drops them without an answer: it checks
+// them against getRace(), the worgen. CMSG_ALTER_APPEARANCE has no script
+// hook, so the packet is taken here before the core sees it, and the haircut is
+// applied to the human set the way the core applies one. Worgen styles, wolf
+// form and other races go on to the core.
+
+static void SendBarberShopResult(Player* player, uint32 result)
+{
+    WorldPacket data(SMSG_BARBER_SHOP_RESULT, 4);
+    data << uint32(result);   // 0 ok, 1 not enough money, 2 not in the chair
+    player->SendDirectMessage(&data);
+}
+
+// The checks and order of WorldSession::HandleAlterAppearance, against the
+// human race.
+static void HumanFormHaircut(Player* player, BarberShopStyleEntry const* hair, uint32 color, uint32 facialId,
+                             uint32 skinId)
+{
+    uint8 const gender = NativeGender(player);
+    if (hair->type != 0 || hair->gender != gender)
+        return;
+
+    BarberShopStyleEntry const* facial = sBarberShopStyleStore.LookupEntry(facialId);
+    if (!facial || facial->type != 2 || facial->race != RACE_HUMAN || facial->gender != gender)
+        return;
+
+    BarberShopStyleEntry const* skin = sBarberShopStyleStore.LookupEntry(skinId);
+    if (skin && (skin->type != 3 || skin->race != RACE_HUMAN || skin->gender != gender))
+        return;
+
+    GameObject* chair = player->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_BARBER_CHAIR, 5.0f);
+    if (!chair || player->getStandState() != UNIT_STAND_STATE_SIT_LOW_CHAIR + chair->GetGOInfo()->barberChair.chairheight)
+    {
+        SendBarberShopResult(player, 2);
+        return;
+    }
+
+    // GetBarberShopCost() compares with the fields.
+    EndFaceRedraw(player);
+    uint32 const cost = player->GetBarberShopCost(hair->hair_id, color, facial->hair_id, skin);
+    if (!player->HasEnoughMoney(cost))
+    {
+        SendBarberShopResult(player, 1);
+        return;
+    }
+    SendBarberShopResult(player, 0);
+
+    player->ModifyMoney(-int32(cost));
+    player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GOLD_SPENT_AT_BARBER, cost);
+
+    player->SetByteValue(PLAYER_BYTES, 2, uint8(hair->hair_id));
+    player->SetByteValue(PLAYER_BYTES, 3, uint8(color));
+    player->SetByteValue(PLAYER_BYTES_2, 0, uint8(facial->hair_id));
+    if (skin)
+        player->SetByteValue(PLAYER_BYTES, 0, uint8(skin->hair_id));
+
+    player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_VISIT_BARBER_SHOP, 1);
+    player->SetStandState(UNIT_STAND_STATE_STAND);
+
+    if (ReadBackFields(player))
+        SaveForms(player);
+}
+
+class worgoblin_barbershop : public ServerScript
+{
+public:
+    worgoblin_barbershop() : ServerScript("worgoblin_barbershop", { SERVERHOOK_CAN_PACKET_RECEIVE }) { }
+
+    // Called for every packet, also in the map threads; CMSG_ALTER_APPEARANCE
+    // itself is handled in the world thread (PROCESS_THREADUNSAFE).
+    bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
+    {
+        if (packet.GetOpcode() != CMSG_ALTER_APPEARANCE || !session)
+            return true;
+
+        Player* player = session->GetPlayer();
+        if (!IsWorgenPlayer(player) || !player->IsInWorld())
+            return true;
+
+        WorgenFormData* d = Forms(player);
+        if (!d->loaded || !d->human || packet.size() < 16)
+            return true;
+
+        WorldPacket copy(packet);   // the core reads the original if we pass it on
+        copy.rpos(0);
+        uint32 hairId, color, facialId, skinId;
+        copy >> hairId >> color >> facialId >> skinId;
+
+        BarberShopStyleEntry const* hair = sBarberShopStyleStore.LookupEntry(hairId);
+        if (!hair || hair->race != RACE_HUMAN)
+            return true;
+
+        HumanFormHaircut(player, hair, color, facialId, skinId);
+        return false;
+    }
+};
+
 class worgoblin_config : public WorldScript
 {
 public:
@@ -792,10 +1028,19 @@ class worgoblin_display : public UnitScript
 public:
     worgoblin_display() : UnitScript("worgoblin_display", true, { UNITHOOK_ON_DISPLAYID_CHANGE }) { }
 
-    void OnDisplayIdChange(Unit* unit, uint32 /*displayId*/) override
+    void OnDisplayIdChange(Unit* unit, uint32 displayId) override
     {
-        if (IsWorgenPlayer(unit))
-            UpdateForm(unit->ToPlayer());
+        if (!IsWorgenPlayer(unit))
+            return;
+
+        Player* player = unit->ToPlayer();
+        UpdateForm(player);
+
+        // Player::InitDisplayIds() (.modify gender) sets the native display to
+        // the worgen model right after this display. In human form, set the
+        // human one again once it has.
+        if (displayId == WorgenDisplay(player) && Forms(player)->human)
+            player->m_Events.AddEventAtOffset([player]() { UpdateForm(player); }, 1ms);
     }
 };
 
@@ -804,6 +1049,7 @@ void Add_Worgoblin()
     new worgoblin();
     new worgoblin_config();
     new worgoblin_display();
+    new worgoblin_barbershop();
     new npc_gilnean_barber();
     RegisterSpellScript(spell_rocket_barrage);
     RegisterSpellAndAuraScriptPair(spell_worgen_two_forms, spell_worgen_two_forms_aura);

@@ -34,8 +34,11 @@ And with that, you are all done!
 ## Two Forms
 
 Worgen learn **Two Forms** (spell 68996) with their other racials and can switch
-between their worgen and human appearance, as in Cataclysm. No client change is
-needed beyond the module's own patch.
+between their worgen and human appearance, as in Cataclysm. The module's own
+patch is all the client needs, except for the transformation effect and sound:
+the server sends SpellVisualKit 16173 (to worgen) and 28505 (to human), which a
+3.3.5 `SpellVisualKit.dbc` does not have. Without those rows the switch is
+silent.
 
 - **Combat brings the wolf out.** The human form is a wish: entering combat
   switches to worgen form, and the human form returns when combat ends. Set
@@ -50,6 +53,11 @@ needed beyond the module's own patch.
   Skin and face cannot be changed at a barbershop in WotLK, so the **Gilnean
   Barber** (Shadowglen and the Stormwind barbershop) does that: stand in human
   form and talk to him.
+- **A worgen druid cannot talk in human form.** The client checks languages
+  against the race/class pairs in its `CharBaseInfo.dbc`, for the race it
+  draws: human, and there is no human druid. It refuses every chat line with
+  "You can't speak that language", GM commands too. Other worgen classes exist
+  as humans and are not affected. The fix is client-side (see below).
 
 How it works in 3.3.5, where the client has neither Cataclysm's aura type nor a
 second appearance per character:
@@ -66,8 +74,24 @@ second appearance per character:
   worgen set is written back in `OnPlayerBeforeLogout`, before `SaveToDB()`.
   If the server dies while someone is in human form, the next login puts it
   right.
-- The barbershop has no script hook, so a haircut in human form is detected by
-  comparing the fields with the saved human set.
+- In human form the **native display** (`UNIT_FIELD_NATIVEDISPLAYID`) is the
+  human one too. The client treats a player whose display differs from the
+  native one as shapeshifted, and refuses the barber chair ("You can't do that
+  while shapeshifted"); the server's `Unit::IsInDisallowedMountForm()` refuses
+  mounts and flight paths for the same reason.
+- In human form the client offers human hair styles at the barbershop, and the
+  core drops them (it checks them against the worgen race). The module takes
+  `CMSG_ALTER_APPEARANCE` before the core does and applies human styles to the
+  human set. Anything else that changes the fields in human form is detected
+  by comparing them with the saved human set.
+- The client draws new textures when the skin changes, not when only the face
+  does. When the Gilnean Barber changes only the face, the skin field shows a
+  neighbouring skin for one server tick before the real one, so the new face
+  appears at once.
+- A worgen druid in human form needs a `CharBaseInfo.dbc` row for race 1, class
+  11 in the client. That row also offers Human Druid at character creation,
+  which the server refuses unless `playercreateinfo` has it, so the character
+  creation screen must hide it.
 
 The SQL (`data/sql/db-world/worgoblin_two_forms.sql`,
 `data/sql/db-characters/worgen_form_appearance.sql`) is applied by the database
