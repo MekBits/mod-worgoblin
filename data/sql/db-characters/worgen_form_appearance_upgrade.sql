@@ -1,8 +1,10 @@
 -- MekBits fork only: servers that ran an earlier Two Forms have
 -- worgen_form_appearance without hs_/hp_, some with a `human` column, and
 -- CREATE TABLE IF NOT EXISTS in worgen_form_appearance.sql leaves it that way.
--- Safe to run more than once, and before the module's own SQL: each step
--- checks the table and its columns first.
+-- Safe to run more than once, before or after the module's own SQL (the
+-- updater runs that first: '.' sorts before '_'): each step checks the table
+-- and its columns first. The ALTER commits on its own, so a run that stops after
+-- it carries the flagged sets over on the next run while `human` is still there.
 --
 -- The earlier versions restored w_ at login when `characters` held a human set
 -- after a crash: always (no `human` column) or when `human` = 1. The current
@@ -38,7 +40,7 @@ PREPARE `stmt` FROM @sql;
 EXECUTE `stmt`;
 DEALLOCATE PREPARE `stmt`;
 
-SET @sql := IF(@has_table = 1 AND @has_hs = 0,
+SET @sql := IF(@has_table = 1 AND (@has_hs = 0 OR @has_human = 1),
   CONCAT(
     'UPDATE `worgen_form_appearance` f JOIN `characters` c ON c.`guid` = f.`guid`
        SET f.`hs_skin` = c.`skin`, f.`hs_face` = c.`face`, f.`hs_hair` = c.`hairStyle`,
