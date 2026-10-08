@@ -48,11 +48,11 @@ silent.
 - **The form survives logout.** The aura is saved like any other, and the
   character list always shows the worgen appearance.
 - **The human form has its own look.** It starts as your worgen choices (always
-  valid, since the worgen ranges are a subset of the human ones). The normal
-  barbershop styles hair, hair colour and facial hair of the form you are in.
-  Skin and face cannot be changed at a barbershop in WotLK, so the **Gilnean
-  Barber** (Shadowglen and the Stormwind barbershop) does that: stand in human
-  form and talk to him.
+  valid, since the worgen ranges are a subset of the human ones). The barber
+  chair styles the worgen form only. The **Gilnean Barber** (Shadowglen and the
+  Stormwind barbershop) styles the human form: skin, face, hair, hair colour
+  and facial hair, free and shown as you choose. Stand in human form and talk
+  to him.
 - **A worgen druid cannot talk in human form.** The client checks languages
   against the race/class pairs in its `CharBaseInfo.dbc`, for the race it
   draws: human, and there is no human druid. It refuses every chat line with
@@ -75,19 +75,22 @@ second appearance per character:
   If the server dies while someone is in human form, the next login puts it
   right.
 - In human form the **native display** (`UNIT_FIELD_NATIVEDISPLAYID`) is the
-  human one too. The client treats a player whose display differs from the
-  native one as shapeshifted, and refuses the barber chair ("You can't do that
-  while shapeshifted"); the server's `Unit::IsInDisallowedMountForm()` refuses
-  mounts and flight paths for the same reason.
-- In human form the client offers human hair styles at the barbershop, and the
-  core drops them (it checks them against the worgen race). The module takes
-  `CMSG_ALTER_APPEARANCE` before the core does and applies human styles to the
-  human set. Anything else that changes the fields in human form is detected
-  by comparing them with the saved human set.
-- The client draws new textures when the skin changes, not when only the face
-  does. When the Gilnean Barber changes only the face, the skin field shows a
-  neighbouring skin for one server tick before the real one, so the new face
-  appears at once.
+  human one too. The server's `Unit::IsInDisallowedMountForm()` refuses mounts
+  and flight paths to a player whose display differs from the native one.
+- The **barber chair cannot style the human form.** The client builds its
+  barbershop style lists once per login, for the race in the first packet that
+  creates your character, which is worgen: the human form is set after it. In
+  the chair it looks your current style up for the race you have then. In
+  human form that finds nothing and the client crashes (`ERROR #132` in
+  `GetBarberShopTotalCost`). So the module refuses the chair in human form. A
+  login to a character that is still in the world sends the form it is in, so
+  after one the chair waits for a normal login.
+- The client reads skin, face and hair when it builds the model, which happens
+  when the display changes. A change to the appearance fields alone does not
+  show the new face. So the Gilnean Barber sets display 907 (male) or 302
+  (female), the same human models, for one server tick and then 49/50 again.
+- Anything else that changes the fields in human form is detected by comparing
+  them with the saved human set.
 - A worgen druid in human form needs a `CharBaseInfo.dbc` row for race 1, class
   11 in the client. That row also offers Human Druid at character creation,
   which the server refuses unless `playercreateinfo` has it, so the character

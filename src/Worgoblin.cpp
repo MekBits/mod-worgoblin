@@ -7,7 +7,6 @@
 #include "Map.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
-#include "Opcodes.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "ScriptedGossip.h"
@@ -15,7 +14,6 @@
 #include "SpellAuraEffects.h"
 #include "Config.h"
 #include "StringFormat.h"
-#include "WorldPacket.h"
 #include "WorldSession.h"
 
 #include <algorithm>
@@ -62,12 +60,10 @@ enum Spells
 // Darkflight (68992) also switches to wolf form: its own description in
 // Spell.dbc says "Activates your true form".
 //
-// The native display follows the form. The 3.3.5 client counts a player whose
-// UNIT_FIELD_DISPLAYID differs from UNIT_FIELD_NATIVEDISPLAYID as
-// shapeshifted: it refuses the barber chair ("You can't do that while
-// shapeshifted"), and the core's Unit::IsInDisallowedMountForm() refuses
-// mounts and taxis. So in human form the native display is the human one, and
-// the worgen model is looked up where it is needed (WorgenDisplay()).
+// The native display follows the form: Unit::IsInDisallowedMountForm()
+// refuses mounts and taxis to a player whose UNIT_FIELD_DISPLAYID differs from
+// UNIT_FIELD_NATIVEDISPLAYID. So in human form the native display is the human
+// one, and the worgen model is looked up where it is needed (WorgenDisplay()).
 
 enum WorgenTwoForms
 {
@@ -76,6 +72,9 @@ enum WorgenTwoForms
     RACE_WORGEN_ID       = 12,   // the free 3.3.5 race slot this module uses
     DISPLAY_HUMAN_MALE   = 49,
     DISPLAY_HUMAN_FEMALE = 50,
+    // The same models as 49/50, also without CreatureDisplayInfoExtra (Redraw()).
+    DISPLAY_HUMAN_MALE_REDRAW   = 907,
+    DISPLAY_HUMAN_FEMALE_REDRAW = 302,
     NPC_GILNEAN_BARBER   = 9000001,
 };
 
@@ -109,9 +108,9 @@ struct WorgenFormData : public DataMap::Base
     bool  human      = false;   // the fields hold the human set
     bool  savedHuman = false;   // `saved` is a human set
     bool  updating   = false;   // inside UpdateForm()
-    bool  redrawing  = false;   // the skin field holds redrawSkin (RedrawFace())
-    uint8 redrawSkin = 0;
-    uint32 redrawId  = 0;       // which RedrawFace() the pending event belongs to
+    bool  redrawing  = false;   // the display may be the redraw display (Redraw())
+    uint32 redrawId  = 0;       // which Redraw() the pending event belongs to
+    uint32 loginTime = 0;       // GetInGameTime() at OnPlayerLogin
 };
 
 static bool sCombatShift = true;
@@ -168,6 +167,18 @@ static uint8 NativeGender(Player* player)
 static uint32 HumanDisplay(Player* player)
 {
     return NativeGender(player) == GENDER_MALE ? DISPLAY_HUMAN_MALE : DISPLAY_HUMAN_FEMALE;
+}
+
+static uint32 RedrawDisplay(Player* player)
+{
+    return NativeGender(player) == GENDER_MALE ? DISPLAY_HUMAN_MALE_REDRAW : DISPLAY_HUMAN_FEMALE_REDRAW;
+}
+
+// A display this module sets in human form.
+static bool IsHumanDisplay(uint32 display)
+{
+    return display == DISPLAY_HUMAN_MALE || display == DISPLAY_HUMAN_FEMALE ||
+           display == DISPLAY_HUMAN_MALE_REDRAW || display == DISPLAY_HUMAN_FEMALE_REDRAW;
 }
 
 // The worgen model, as Player::InitDisplayIds() picks it. Not the native
@@ -314,32 +325,28 @@ static void AfterFieldsSent(Player* player, Fn fn)
     }, 1ms);
 }
 
-// Puts the real skin back after RedrawFace(), if nothing has rewritten the
-// field since. Called before anything reads the fields back, so the stand-in
-// skin is never taken for a barbershop change.
-static void EndFaceRedraw(Player* player)
+// Puts the human display back after Redraw(), if nothing has replaced the
+// redraw display since.
+static void EndRedraw(Player* player)
 {
     WorgenFormData* d = Forms(player);
     if (!d->redrawing)
         return;
 
     d->redrawing = false;
-    if (d->human && player->GetByteValue(PLAYER_BYTES, 0) == d->redrawSkin)
-        player->SetByteValue(PLAYER_BYTES, 0, d->h[A_SKIN]);
+    if (player->GetDisplayId() == RedrawDisplay(player))
+        player->SetUInt32Value(UNIT_FIELD_DISPLAYID, HumanDisplay(player));
 }
 
 // The barbershop has no script hook: WorldSession::HandleAlterAppearance ->
 // Player::ChangeBarberShopStyle calls no scripts. So a haircut is detected by
-// comparing. In human form, fields that differ from the human set can only
-// come from the barbershop -> adopt them for the human form. A real client in
-// human form sends human styles, which HumanFormHaircut() below applies;
-// worgen styles go through the core, which accepts them (it checks getRace()),
-// so they are moved to valid human values here. In wolf form the fields are
-// the wolf set. Returns true if the human set changed.
+// comparing. In wolf form the fields are the wolf set. In human form the
+// barber chair is refused (worgoblin_barber_chair), but a haircut sent anyway
+// goes through the core, which takes worgen styles (it checks getRace()); they
+// are moved to valid human values here. Returns true if the human set changed.
 static bool ReadBackFields(Player* player)
 {
     WorgenFormData* d = Forms(player);
-    EndFaceRedraw(player);
 
     if (!d->human)
     {
@@ -386,8 +393,7 @@ static void SetWorgenForm(Player* player, bool human, bool asked, bool visual)
     // In wolf form only replace our own human display, or one handed to Two
     // Forms. Any other display (a GM's .morph) was set on purpose.
     uint32 const current = player->GetDisplayId();
-    bool const ours = current == DISPLAY_HUMAN_MALE || current == DISPLAY_HUMAN_FEMALE;
-    if (current != display && (human || ours || asked))
+    if (current != display && (human || IsHumanDisplay(current) || asked))
     {
         // SetDisplayId() resets the scale; keep scale auras (Giant Growth).
         player->SetDisplayId(display);
@@ -412,8 +418,7 @@ static bool WantsHuman(Player* player)
 
 static bool IsPlayerModel(Player* player, uint32 display)
 {
-    return display == WorgenDisplay(player) || display == DISPLAY_HUMAN_MALE ||
-           display == DISPLAY_HUMAN_FEMALE;
+    return display == WorgenDisplay(player) || IsHumanDisplay(display);
 }
 
 // The one place the form is decided, called from every hook that can change
@@ -518,6 +523,24 @@ static uint8 CycleFace(Player* player, uint8 cur, uint8 skin, int dir)
     return NextValid(cur, dir, [player, skin](uint8 v) { return HumanFaceExists(player, v, skin); });
 }
 
+static uint8 CycleHair(Player* player, uint8 cur, int dir)
+{
+    return NextValid(cur, dir, [player](uint8 v) { return HumanBarberStyleExists(player, 0, v); });
+}
+
+static uint8 CycleHairColor(Player* player, uint8 cur, uint8 hair, int dir)
+{
+    return NextValid(cur, dir, [player, hair](uint8 v)
+    {
+        return HumanSectionExists(player, SECTION_TYPE_HAIR, hair, v, false);
+    });
+}
+
+static uint8 CycleFacialHair(Player* player, uint8 cur, int dir)
+{
+    return NextValid(cur, dir, [player](uint8 v) { return HumanBarberStyleExists(player, 2, v); });
+}
+
 // Moves every invalid value to the next valid one. Returns true if anything
 // changed.
 static bool ClampHuman(Player* player, uint8* a)
@@ -528,19 +551,12 @@ static bool ClampHuman(Player* player, uint8* a)
         a[A_SKIN] = CycleSkin(player, a[A_SKIN], 1);
     if (!HumanFaceExists(player, a[A_FACE], a[A_SKIN]))
         a[A_FACE] = CycleFace(player, a[A_FACE], a[A_SKIN], 1);
-
-    auto hairValid = [player](uint8 v) { return HumanBarberStyleExists(player, 0, v); };
-    if (!hairValid(a[A_HAIR]))
-        a[A_HAIR] = NextValid(a[A_HAIR], 1, hairValid);
-
-    uint8 const hair = a[A_HAIR];
-    auto colorValid = [player, hair](uint8 v) { return HumanSectionExists(player, SECTION_TYPE_HAIR, hair, v, false); };
-    if (!colorValid(a[A_HAIRCOLOR]))
-        a[A_HAIRCOLOR] = NextValid(a[A_HAIRCOLOR], 1, colorValid);
-
-    auto facialValid = [player](uint8 v) { return HumanBarberStyleExists(player, 2, v); };
-    if (!facialValid(a[A_FACIALHAIR]))
-        a[A_FACIALHAIR] = NextValid(a[A_FACIALHAIR], 1, facialValid);
+    if (!HumanBarberStyleExists(player, 0, a[A_HAIR]))
+        a[A_HAIR] = CycleHair(player, a[A_HAIR], 1);
+    if (!HumanSectionExists(player, SECTION_TYPE_HAIR, a[A_HAIR], a[A_HAIRCOLOR], false))
+        a[A_HAIRCOLOR] = CycleHairColor(player, a[A_HAIRCOLOR], a[A_HAIR], 1);
+    if (!HumanBarberStyleExists(player, 2, a[A_FACIALHAIR]))
+        a[A_FACIALHAIR] = CycleFacialHair(player, a[A_FACIALHAIR], 1);
 
     return !std::equal(a, a + A_COUNT, old);
 }
@@ -559,9 +575,11 @@ public:
             return;
 
         LoadForms(player);
+        Forms(player)->loginTime = player->GetInGameTime();
 
         // The aura was re-applied during _LoadAuras, BEFORE this hook, when
-        // the appearance was not loaded yet.
+        // the appearance was not loaded yet. The create packet has gone out
+        // with the worgen race (worgoblin_barber_chair).
         UpdateForm(player);
     }
 
@@ -616,12 +634,12 @@ public:
             discount *= 0.8;
     }
 
-    // RedrawFace() restores the skin from the map it was started on; a player
+    // Redraw() restores the display from the map it was started on; a player
     // who changed map before that never gets the event.
     void OnPlayerMapChanged(Player* player) override
     {
         if (IsWorgenPlayer(player) && Forms(player)->loaded)
-            EndFaceRedraw(player);
+            EndRedraw(player);
     }
 
     void OnPlayerEnterCombat(Player* player, Unit* /*enemy*/) override
@@ -759,54 +777,57 @@ class spell_worgen_darkflight : public SpellScript
 
 // --- Gilnean Barber -------------------------------------------------------
 //
-// The barbershop only does hair style, hair colour and facial hair. Skin and
-// face are set at character creation in WotLK, so this NPC handles them.
-// Everything is applied live, so the menu itself is the preview - which is why
-// you have to be in human form to use it.
+// Styles the human form: skin and face, which no barbershop changes in WotLK,
+// and hair, hair colour and facial hair, which the barber chair cannot do in
+// human form (worgoblin_barber_chair). Everything is applied live, so the menu
+// itself is the preview - which is why you have to be in human form to use it.
 
-// The client builds a player's textures again when the skin changes, not when
-// only the face does, so a new face alone would stay invisible until the next
-// form change. So the skin field shows a neighbouring skin for one map update and
-// then the real one again: the second change draws the new face.
-static void RedrawFace(Player* player)
+// The client reads the appearance fields when it builds the model, which it
+// does when the display changes. A change to the fields alone recolours the
+// model it has, with the old face. So the display shows an identical human
+// model for one map update and then the human display again: both changes build
+// the model with the new fields.
+static void Redraw(Player* player)
 {
     WorgenFormData* d = Forms(player);
-    uint8 const skin = d->h[A_SKIN];
-    uint8 const face = d->h[A_FACE];
 
-    // Preferably a skin that has this face, so the update in between has one.
-    uint8 stand = skin;
-    for (int dir : { 1, -1 })
+    uint32 const current = player->GetDisplayId();
+    if (current == RedrawDisplay(player))
     {
-        uint8 const candidate = CycleSkin(player, skin, dir);
-        if (candidate != skin && HumanFaceExists(player, face, candidate))
-        {
-            stand = candidate;
-            break;
-        }
+        EndRedraw(player);   // switching back builds the model too
+        return;
     }
-    if (stand == skin)
-        stand = CycleSkin(player, skin, 1);
-    if (stand == skin)
-        return;   // a single skin: nothing to switch through
 
-    player->SetByteValue(PLAYER_BYTES, 0, stand);
+    // A costume or a druid form owns the display; the model is built again
+    // when it ends.
+    if (current != HumanDisplay(player))
+        return;
+
+    // The field only: SetDisplayId() calls OnDisplayIdChange, and UpdateForm()
+    // would put the human display back before anything is sent.
+    player->SetUInt32Value(UNIT_FIELD_DISPLAYID, RedrawDisplay(player));
     d->redrawing = true;
-    d->redrawSkin = stand;
     uint32 const id = ++d->redrawId;
     AfterFieldsSent(player, [id](Player* p)
     {
         if (Forms(p)->redrawId == id)
-            EndFaceRedraw(p);
+            EndRedraw(p);
     });
 }
 
+// Next and previous of each value are consecutive.
 enum GilneanBarberActions
 {
     GB_SKIN_NEXT = GOSSIP_ACTION_INFO_DEF + 1,
     GB_SKIN_PREV,
     GB_FACE_NEXT,
     GB_FACE_PREV,
+    GB_HAIR_NEXT,
+    GB_HAIR_PREV,
+    GB_HAIRCOLOR_NEXT,
+    GB_HAIRCOLOR_PREV,
+    GB_FACIALHAIR_NEXT,
+    GB_FACIALHAIR_PREV,
     GB_RESET,
     GB_DONE,
 };
@@ -847,34 +868,33 @@ public:
             return true;
         }
 
-        EndFaceRedraw(player);
-        uint8 const oldSkin = d->h[A_SKIN];
-        uint8 const oldFace = d->h[A_FACE];
+        uint8 const old[A_COUNT] = { d->h[0], d->h[1], d->h[2], d->h[3], d->h[4] };
+        int const dir = (action - GB_SKIN_NEXT) % 2 == 0 ? 1 : -1;
 
         switch (action)
         {
             case GB_SKIN_NEXT:
             case GB_SKIN_PREV:
-            {
-                int dir = (action == GB_SKIN_NEXT) ? 1 : -1;
                 d->h[A_SKIN] = CycleSkin(player, d->h[A_SKIN], dir);
-                // Faces are tied to the skin colour; the old one may not exist
-                // for the new skin, so move to the nearest one that does.
-                if (!HumanFaceExists(player, d->h[A_FACE], d->h[A_SKIN]))
-                    d->h[A_FACE] = CycleFace(player, d->h[A_FACE], d->h[A_SKIN], 1);
                 break;
-            }
             case GB_FACE_NEXT:
             case GB_FACE_PREV:
-            {
-                int dir = (action == GB_FACE_NEXT) ? 1 : -1;
                 d->h[A_FACE] = CycleFace(player, d->h[A_FACE], d->h[A_SKIN], dir);
                 break;
-            }
+            case GB_HAIR_NEXT:
+            case GB_HAIR_PREV:
+                d->h[A_HAIR] = CycleHair(player, d->h[A_HAIR], dir);
+                break;
+            case GB_HAIRCOLOR_NEXT:
+            case GB_HAIRCOLOR_PREV:
+                d->h[A_HAIRCOLOR] = CycleHairColor(player, d->h[A_HAIRCOLOR], d->h[A_HAIR], dir);
+                break;
+            case GB_FACIALHAIR_NEXT:
+            case GB_FACIALHAIR_PREV:
+                d->h[A_FACIALHAIR] = CycleFacialHair(player, d->h[A_FACIALHAIR], dir);
+                break;
             case GB_RESET:
-                d->h[A_SKIN] = d->w[A_SKIN];
-                d->h[A_FACE] = d->w[A_FACE];
-                ClampHuman(player, d->h);
+                std::copy(d->w, d->w + A_COUNT, d->h);
                 break;
             case GB_DONE:
             default:
@@ -884,30 +904,39 @@ public:
                 return true;
         }
 
-        WriteAppearance(player, d->h);   // live preview
-        if (d->h[A_FACE] != oldFace && d->h[A_SKIN] == oldSkin)
-            RedrawFace(player);
-        SaveForms(player);
+        // Faces are tied to the skin colour and hair colours to the style, so
+        // a new skin or style may need the nearest face or colour that exists.
+        ClampHuman(player, d->h);
+
+        if (!SameSet(old, d->h))
+        {
+            WriteAppearance(player, d->h);   // live preview
+            Redraw(player);
+            SaveForms(player);
+        }
         BuildMenu(player, creature);
         return true;
     }
 
 private:
+    static void AddPair(Player* player, std::string const& what, uint8 now, uint32 next)
+    {
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Next " + what + " (now: " + std::to_string(uint32(now)) + ")",
+            GOSSIP_SENDER_MAIN, next);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Previous " + what, GOSSIP_SENDER_MAIN, next + 1);
+    }
+
     static void BuildMenu(Player* player, Creature* creature)
     {
         WorgenFormData* d = Forms(player);
 
         ClearGossipMenuFor(player);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
-            "Next skin tone (now: " + std::to_string(uint32(d->h[A_SKIN])) + ")",
-            GOSSIP_SENDER_MAIN, GB_SKIN_NEXT);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Previous skin tone",
-            GOSSIP_SENDER_MAIN, GB_SKIN_PREV);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT,
-            "Next face (now: " + std::to_string(uint32(d->h[A_FACE])) + ")",
-            GOSSIP_SENDER_MAIN, GB_FACE_NEXT);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Previous face",
-            GOSSIP_SENDER_MAIN, GB_FACE_PREV);
+        AddPair(player, "skin tone", d->h[A_SKIN], GB_SKIN_NEXT);
+        AddPair(player, "face", d->h[A_FACE], GB_FACE_NEXT);
+        AddPair(player, "hair style", d->h[A_HAIR], GB_HAIR_NEXT);
+        AddPair(player, "hair colour", d->h[A_HAIRCOLOR], GB_HAIRCOLOR_NEXT);
+        AddPair(player, NativeGender(player) == GENDER_MALE ? "facial hair" : "piercings", d->h[A_FACIALHAIR],
+                GB_FACIALHAIR_NEXT);
         AddGossipItemFor(player, GOSSIP_ICON_TALK, "Reset to my wolf choices",
             GOSSIP_SENDER_MAIN, GB_RESET);
         AddGossipItemFor(player, GOSSIP_ICON_TALK, "That looks right",
@@ -916,103 +945,36 @@ private:
     }
 };
 
-// --- Barbershop in human form ------------------------------------------------
+// --- Barber chair ------------------------------------------------------------
 //
-// In human form the client offers human styles (it reads the race byte), and
-// WorldSession::HandleAlterAppearance drops them without an answer: it checks
-// them against getRace(), the worgen. CMSG_ALTER_APPEARANCE has no script
-// hook, so the packet is taken here before the core sees it, and the haircut is
-// applied to the human set the way the core applies one. Worgen styles, wolf
-// form and other races go on to the core.
-
-static void SendBarberShopResult(Player* player, uint32 result)
-{
-    WorldPacket data(SMSG_BARBER_SHOP_RESULT, 4);
-    data << uint32(result);   // 0 ok, 1 not enough money, 2 not in the chair
-    player->SendDirectMessage(&data);
-}
-
-// The checks and order of WorldSession::HandleAlterAppearance, against the
-// human race.
-static void HumanFormHaircut(Player* player, BarberShopStyleEntry const* hair, uint32 color, uint32 facialId,
-                             uint32 skinId)
-{
-    uint8 const gender = NativeGender(player);
-    if (hair->type != 0 || hair->gender != gender)
-        return;
-
-    BarberShopStyleEntry const* facial = sBarberShopStyleStore.LookupEntry(facialId);
-    if (!facial || facial->type != 2 || facial->race != RACE_HUMAN || facial->gender != gender)
-        return;
-
-    BarberShopStyleEntry const* skin = sBarberShopStyleStore.LookupEntry(skinId);
-    if (skin && (skin->type != 3 || skin->race != RACE_HUMAN || skin->gender != gender))
-        return;
-
-    GameObject* chair = player->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_BARBER_CHAIR, 5.0f);
-    if (!chair || player->getStandState() != UNIT_STAND_STATE_SIT_LOW_CHAIR + chair->GetGOInfo()->barberChair.chairheight)
-    {
-        SendBarberShopResult(player, 2);
-        return;
-    }
-
-    // GetBarberShopCost() compares with the fields.
-    EndFaceRedraw(player);
-    uint32 const cost = player->GetBarberShopCost(hair->hair_id, color, facial->hair_id, skin);
-    if (!player->HasEnoughMoney(cost))
-    {
-        SendBarberShopResult(player, 1);
-        return;
-    }
-    SendBarberShopResult(player, 0);
-
-    player->ModifyMoney(-int32(cost));
-    player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GOLD_SPENT_AT_BARBER, cost);
-
-    player->SetByteValue(PLAYER_BYTES, 2, uint8(hair->hair_id));
-    player->SetByteValue(PLAYER_BYTES, 3, uint8(color));
-    player->SetByteValue(PLAYER_BYTES_2, 0, uint8(facial->hair_id));
-    if (skin)
-        player->SetByteValue(PLAYER_BYTES, 0, uint8(skin->hair_id));
-
-    player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_VISIT_BARBER_SHOP, 1);
-    player->SetStandState(UNIT_STAND_STATE_STAND);
-
-    if (ReadBackFields(player))
-        SaveForms(player);
-}
-
-class worgoblin_barbershop : public ServerScript
+// The client builds its barbershop style lists once per login, for the race
+// byte in the create packet of its own player, and looks the current styles up
+// in them for the race byte it has when the chair opens. When the two differ
+// the lookup finds nothing, and GetBarberShopTotalCost crashes the client. A
+// login sends the worgen race (OnPlayerLogin sets the human form after the
+// create packet), so the chair is only for the wolf form. Logging in to a
+// character still in the world sends the form it is in and calls no script;
+// GetInGameTime() changes then, and the chair waits for a real login.
+class worgoblin_barber_chair : public AllGameObjectScript
 {
 public:
-    worgoblin_barbershop() : ServerScript("worgoblin_barbershop", { SERVERHOOK_CAN_PACKET_RECEIVE }) { }
+    worgoblin_barber_chair() : AllGameObjectScript("worgoblin_barber_chair") { }
 
-    // Called for every packet, also in the map threads; CMSG_ALTER_APPEARANCE
-    // itself is handled in the world thread (PROCESS_THREADUNSAFE).
-    bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
+    bool CanGameObjectGossipHello(Player* player, GameObject* go) override
     {
-        if (packet.GetOpcode() != CMSG_ALTER_APPEARANCE || !session)
-            return true;
-
-        Player* player = session->GetPlayer();
-        if (!IsWorgenPlayer(player) || !player->IsInWorld())
-            return true;
+        if (go->GetGoType() != GAMEOBJECT_TYPE_BARBER_CHAIR || !IsWorgenPlayer(player))
+            return false;
 
         WorgenFormData* d = Forms(player);
-        if (!d->loaded || !d->human || packet.size() < 16)
-            return true;
+        if (d->human)
+            ChatHandler(player->GetSession()).SendNotification(
+                "The barber chair is for your worgen form. The Gilnean Barber styles your human form.");
+        else if (!d->loaded || player->GetInGameTime() != d->loginTime)
+            ChatHandler(player->GetSession()).SendNotification("Log out and back in to use the barber chair.");
+        else
+            return false;
 
-        WorldPacket copy(packet);   // the core reads the original if we pass it on
-        copy.rpos(0);
-        uint32 hairId, color, facialId, skinId;
-        copy >> hairId >> color >> facialId >> skinId;
-
-        BarberShopStyleEntry const* hair = sBarberShopStyleStore.LookupEntry(hairId);
-        if (!hair || hair->race != RACE_HUMAN)
-            return true;
-
-        HumanFormHaircut(player, hair, color, facialId, skinId);
-        return false;
+        return true;
     }
 };
 
@@ -1057,7 +1019,7 @@ void Add_Worgoblin()
     new worgoblin();
     new worgoblin_config();
     new worgoblin_display();
-    new worgoblin_barbershop();
+    new worgoblin_barber_chair();
     new npc_gilnean_barber();
     RegisterSpellScript(spell_rocket_barrage);
     RegisterSpellAndAuraScriptPair(spell_worgen_two_forms, spell_worgen_two_forms_aura);
