@@ -1,3 +1,15 @@
+-- SkillRaceClassInfo.dbc rows with the module's changes. Rows 117, 140, 622,
+-- 628, 629, 631, 632, 634, 636, 637, 642 and 643 let goblins and worgen use
+-- the weapons every other race of their class can: goblins as orcs, worgen as
+-- humans, or night elves for hunters and druids. data/patch/DBFilesClient/
+-- SkillRaceClassInfo.dbc has the same values.
+--
+-- A row that is already in the table keeps the race bits it has and gains the
+-- ones below. Other files add race bits to these rows after this one has run
+-- (a race module widening the masks of the rows it finds), and the updater
+-- runs this file again whenever it changes. Deleting the rows first, as the
+-- upstream module does, would throw those bits away without running the
+-- file that added them again.
 INSERT INTO `skillraceclassinfo_dbc` (`ID`, `SkillID`, `RaceMask`, `ClassMask`, `Flags`, `MinLevel`, `SkillTierID`, `SkillCostIndex`) VALUES
 (21, 293, 4095, 3, 128, 40, 0, 0), -- redo this
 (27, 356, 4095, 1535, 128, 0, 23, 0),
@@ -12,7 +24,9 @@ INSERT INTO `skillraceclassinfo_dbc` (`ID`, `SkillID`, `RaceMask`, `ClassMask`, 
 (85, 138, 4095, 1535, 128, 0, 0, 0),
 (88, 141, 4095, 1535, 160, 0, 21, 0),
 (93, 140, 4095, 1535, 128, 0, 0, 0),
+(117, 44, 422, 4, 128, 0, 0, 0),
 (133, 46, 2340, 4, 128, 0, 0, 0),
+(140, 43, 3419, 1, 128, 0, 0, 0),
 (145, 413, 4095, 68, 128, 40, 0, 0),
 (146, 413, 4095, 35, 128, 0, 0, 0),
 (147, 414, 4095, 1135, 128, 0, 0, 0),
@@ -24,10 +38,28 @@ INSERT INTO `skillraceclassinfo_dbc` (`ID`, `SkillID`, `RaceMask`, `ClassMask`, 
 (281, 333, 4095, 1535, 160, 0, 62, 0),
 (282, 185, 4095, 1535, 128, 0, 61, 0),
 (284, 197, 4095, 1535, 160, 0, 62, 0),
+(622, 172, 3577, 1, 128, 0, 0, 0),
 (624, 160, 288, 1, 128, 0, 0, 0),
 (625, 160, 261855, 1, 128, 0, 0, 0),
+(628, 44, 3592, 4, 128, 0, 0, 0),
+(629, 44, 2471, 1, 128, 0, 0, 0),
+(631, 173, 2568, 4, 128, 0, 0, 0),
+(632, 173, 1446, 4, 128, 0, 0, 0),
+(634, 173, 3367, 1, 128, 0, 0, 0),
+(636, 54, 3181, 1, 128, 0, 0, 0),
+(637, 54, 914, 1, 128, 0, 0, 0),
+(642, 173, 2056, 1024, 128, 0, 0, 0),
+(643, 54, 2056, 1024, 128, 0, 0, 0),
 (865, 142, 4095, 1535, 0, 0, 0, 0),
 (866, 755, 4095, 1535, 160, 0, 41, 0),
 (899, 165, 4095, 1535, 160, 0, 41, 0),
 (971, 789, 2048, 1469, 1170, 0, 0, 0),
-(972, 790, 256, 509, 1170, 0, 0, 0);
+(972, 790, 256, 509, 1170, 0, 0, 0) AS `incoming`
+ON DUPLICATE KEY UPDATE
+  `SkillID` = `incoming`.`SkillID`,
+  `RaceMask` = `skillraceclassinfo_dbc`.`RaceMask` | `incoming`.`RaceMask`,
+  `ClassMask` = `incoming`.`ClassMask`,
+  `Flags` = `incoming`.`Flags`,
+  `MinLevel` = `incoming`.`MinLevel`,
+  `SkillTierID` = `incoming`.`SkillTierID`,
+  `SkillCostIndex` = `incoming`.`SkillCostIndex`;
